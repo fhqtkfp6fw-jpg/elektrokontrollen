@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Elektrokontrolle">
+<title>Elektrokontrolle NIV</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="topbar">
+  <div id="apptitle">⚡ Elektrokontrolle</div>
+  <div id="ctxtitle"></div>
+  <div id="savestate" class="saved">✓ Gespeichert</div>
+</header>
+
+<main id="view"></main>
+
+<nav id="tabbar">
+  <button data-view="kontrollen"><span class="ico">🗂</span>Kontrollen</button>
+  <button data-view="kunde"><span class="ico">👤</span>Kunde</button>
+  <button data-view="uv"><span class="ico">🔌</span>Verteiler</button>
+  <button data-view="fill"><span class="ico">⚡</span>Ausfüllen</button>
+  <button data-view="mess"><span class="ico">📋</span>Messen</button>
+  <button data-view="maengel"><span class="ico">⚠️</span>Mängel</button>
+  <button data-view="export"><span class="ico">📤</span>Export</button>
+  <button data-view="settings"><span class="ico">⚙️</span>Optionen</button>
+</nav>
+
+<div id="printarea"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
