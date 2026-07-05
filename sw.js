@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE = 'nivapp-v8';
+const CACHE = 'nivapp-v15';
 const ASSETS = ['./', './index.html', './app.css', './app.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

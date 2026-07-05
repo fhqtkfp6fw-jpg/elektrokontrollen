@@ -36,6 +36,12 @@ body {
 #savestate { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: #24406b; white-space: nowrap; }
 #savestate.saved { background: #14532d; }
 #savestate.saving { background: #92610a; }
+#fsbtn {
+  border: 1px solid #3a3f47; background: none; color: #cbd2da; cursor: pointer;
+  font-size: 18px; line-height: 1; width: 36px; height: 36px; border-radius: 8px;
+  flex: 0 0 auto; padding: 0;
+}
+#fsbtn.active { background: #24406b; color: #fff; }
 
 #view {
   padding: calc(var(--top-h) + env(safe-area-inset-top) + 12px) 14px calc(var(--tab-h) + env(safe-area-inset-bottom) + 16px);
@@ -69,7 +75,7 @@ h3 { font-size: 16px; margin: 18px 0 8px; }
 .warntext { color: var(--warn); }
 
 label.f { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 3px; }
-input[type=text], input[type=number], textarea, select {
+input[type=text], input[type=number], input[type=date], textarea, select {
   width: 100%; font-size: 16px; font-family: inherit; color: var(--ink);
   padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff;
 }
@@ -170,8 +176,15 @@ table.mess tr.zuleitung { background: #fdf6d8; }
 
 .kcard { display: flex; align-items: center; gap: 12px; }
 .kcard.done { border-left: 5px solid var(--ok); }
-.kdonelbl { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); white-space: nowrap; cursor: pointer; }
-.kdonelbl input { width: 24px; height: 24px; accent-color: var(--ok); }
+.statusbadge {
+  font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px;
+  background: #e3ecf7; color: var(--accent); vertical-align: middle; white-space: nowrap;
+}
+.statusbadge.sb-done { background: #d9f2e0; color: var(--ok); }
+.zdel {
+  border: none; background: none; color: var(--danger); cursor: pointer;
+  font-size: 13px; padding: 2px 6px; vertical-align: middle;
+}
 .kcard .kinfo { flex: 1; }
 .kcard .kinfo .kt { font-weight: 700; font-size: 16px; }
 .kcard .kinfo .ks { font-size: 13px; color: var(--muted); margin-top: 3px; }

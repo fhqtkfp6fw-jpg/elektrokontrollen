@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS = {
   risoDefault: '500',
   rloDefault: 'i.o.',
   idnDefault: '30',
+  inspektoren: [],   // [{kuerzel, name, tel, mail}] – gepflegt in den Optionen
   gebaeudeArten: ['EFH', 'MFH', 'Gewerbe', 'Landwirtschaft', 'Öffentliches Gebäude', 'Garage/Nebengebäude'],
   firmaName: '',
   firmaStrasse: '',
@@ -84,17 +85,50 @@ function newGruppe(nr, bez) {
   };
 }
 
+// Hinweis: uv.ort enthält seit v1.5 die ZÄHLERNUMMER der Anlage (Feld wurde
+// umgenutzt, Property-Name blieb für Datenkompatibilität). uv.geprueft = [Kürzel].
 function newUv(name) {
-  return { id: uid(), name: name || '', ort: '', stromkunde: '', gruppen: [newGruppe('', 'Zuleitung UV')] };
+  return { id: uid(), name: name || '', ort: '', stromkunde: '', geprueft: [], gruppen: [newGruppe('', 'Zuleitung UV')] };
+}
+
+const STATUS_STUFEN = ['Erfasst', 'Gemessen', 'Geschrieben', 'Abgerechnet', 'Abgeschlossen'];
+
+function furthestStatus(k) {
+  let idx = -1;
+  for (const e of (k.statusLog || [])) {
+    const i = STATUS_STUFEN.indexOf(e.status);
+    if (i > idx) idx = i;
+  }
+  if (idx < 0 && k.abgeschlossen) return 'Abgeschlossen'; // Altdaten mit v1.4-Haken
+  return idx >= 0 ? STATUS_STUFEN[idx] : '';
+}
+
+function setStatus(k, status, kz) {
+  (k.statusLog = k.statusLog || []).push({ status, kz, ts: Date.now() });
+  save();
+}
+
+// Summe der erfassten Arbeitszeiten ("3.5 h", "2,25" etc. → Zahl); Fallback: altes Einzelfeld
+function zeitTotal(k) {
+  let sum = 0, any = false;
+  for (const e of (k.zeitLog || [])) {
+    const m = String(e.zeit).replace(',', '.').match(/[\d.]+/);
+    if (m) { sum += parseFloat(m[0]); any = true; }
+  }
+  if (any) return (Math.round(sum * 100) / 100) + ' h';
+  return k.arbeitszeit || '';
 }
 
 function newKontrolle() {
   return {
     id: uid(), createdAt: Date.now(), updatedAt: Date.now(),
     abgeschlossen: false,
-    arbeitszeit: '',
+    statusLog: [],   // [{status, kz, ts}] – wer hat wann welchen Status gesetzt
+    zeitLog: [],     // [{zeit, kz, ts}] – erfasste Arbeitszeiten pro Person
+    hak: '',         // Hausanschlusskasten (einer pro Gebäude) – geprüft beim Status «Gemessen»
+    arbeitszeit: '', // LEGACY (bis v1.5, einzelnes Textfeld) – zeitTotal() nutzt es als Fallback
     kunde: {
-      auftragNr: '', auftragBez: '', kontrollumfang: '',
+      auftragNr: '', auftragBez: '', kontrollumfang: '', planDatum: '',
       gebaeudeart: '', strasse: '', plz: '', ort: '', zaehler: '', bemerkung: '',
       eigName: '', eigStrasse: '', eigPlz: '', eigOrt: '', eigTel: '', eigMail: '',
       rechAbw: false, rechName: '', rechStrasse: '', rechPlz: '', rechOrt: ''
@@ -134,7 +168,7 @@ function setSaveState(cls, txt) {
 }
 
 function save(immediate) {
-  if (!S.kontrolle) return;
+  if (!S.kontrolle || !S.kontrolle.id) return;
   S.kontrolle.updatedAt = Date.now();
   setSaveState('saving', '● Speichert…');
   clearTimeout(saveTimer);
@@ -217,21 +251,30 @@ function render() {
 
 async function renderKontrollen() {
   const v = $('#view');
-  const list = (await dbAll('kontrollen')).sort((a, b) => b.updatedAt - a.updatedAt);
+  // Sortierung: geplantes Kontrolldatum aufsteigend (nächster Termin zuoberst),
+  // Kontrollen ohne Datum danach (neueste Änderung zuerst)
+  const list = (await dbAll('kontrollen')).sort((a, b) => {
+    const da = a.kunde.planDatum || '';
+    const db_ = b.kunde.planDatum || '';
+    if (da && db_) return da.localeCompare(db_) || b.updatedAt - a.updatedAt;
+    if (da) return -1;
+    if (db_) return 1;
+    return b.updatedAt - a.updatedAt;
+  });
   let html = `<h2>Kontrollen</h2>
     <div class="btnrow"><button class="btn primary" id="btnNewK">＋ Neue Kontrolle</button></div>`;
   if (!list.length) html += `<div class="empty">Noch keine Kontrollen erfasst.</div>`;
   for (const k of list) {
     const open = S.kontrolle && S.kontrolle.id === k.id;
-    const status = k.abgeschlossen
-      ? ' <span style="color:var(--ok)">✓ abgeschlossen</span>'
-      : (open ? ' <span style="color:var(--accent)">● offen</span>' : '');
-    html += `<div class="card kcard ${k.abgeschlossen ? 'done' : ''}" data-id="${k.id}">
+    const stufe = furthestStatus(k);
+    const done = stufe === 'Abgeschlossen';
+    const badges = (stufe ? ` <span class="statusbadge ${done ? 'sb-done' : ''}">${esc(stufe)}</span>` : '')
+      + (open ? ' <span style="color:var(--accent)">● geöffnet</span>' : '');
+    html += `<div class="card kcard ${done ? 'done' : ''}" data-id="${k.id}">
       <div class="kinfo">
-        <div class="kt">${esc(kontrolleTitle(k))}${status}</div>
-        <div class="ks">${esc(k.kunde.gebaeudeart || '–')} · Zähler ${esc(k.kunde.zaehler || '–')} · ${k.uvs.length} UV · ${k.maengel.filter(m => !istInfo(m)).length} Mängel${k.arbeitszeit ? ' · ⏱ ' + esc(k.arbeitszeit) : ''} · geändert ${fmtDate(k.updatedAt)}</div>
+        <div class="kt">${esc(kontrolleTitle(k))}${badges}</div>
+        <div class="ks">${k.kunde.planDatum ? '📅 <b>' + esc(new Date(k.kunde.planDatum + 'T12:00:00').toLocaleDateString('de-CH')) + '</b> · ' : ''}${esc(k.kunde.gebaeudeart || '–')} · VNB ${esc(k.kunde.zaehler || '–')} · ${k.uvs.length} Anlagen · ${k.maengel.filter(m => !istInfo(m)).length} Mängel${zeitTotal(k) ? ' · ⏱ ' + esc(zeitTotal(k)) : ''} · geändert ${fmtDate(k.updatedAt)}</div>
       </div>
-      <label class="kdonelbl"><input type="checkbox" class="kdone" ${k.abgeschlossen ? 'checked' : ''}>Abgeschlossen</label>
       <button class="btn primary small" data-act="open">Öffnen</button>
       <button class="btn danger small" data-act="del">Löschen</button>
     </div>`;
@@ -243,15 +286,6 @@ async function renderKontrollen() {
     await dbPut('kontrollen', S.kontrolle);
     go('kunde');
   });
-  $$('.kcard .kdone').forEach(cb => cb.addEventListener('change', async () => {
-    const id = cb.closest('.kcard').dataset.id;
-    const k = list.find(x => x.id === id);
-    if (!k) return;
-    k.abgeschlossen = cb.checked;
-    await dbPut('kontrollen', k);
-    if (S.kontrolle && S.kontrolle.id === id) S.kontrolle.abgeschlossen = cb.checked;
-    render();
-  }));
   $$('.kcard button').forEach(b => b.addEventListener('click', async () => {
     const id = b.closest('.kcard').dataset.id;
     if (b.dataset.act === 'open') {
@@ -284,13 +318,14 @@ function renderKunde() {
       <div class="narrow" style="flex:0 0 200px"><label class="f">Auftragsnummer</label><input type="text" id="k_anr" value="${esc(ku.auftragNr)}"></div>
       <div><label class="f">Auftragsbezeichnung</label><input type="text" id="k_abez" value="${esc(ku.auftragBez)}" placeholder="z.B. Periodische Kontrolle NIV 25"></div>
       <div><label class="f">Kontrollumfang</label><input type="text" id="k_kumf" value="${esc(ku.kontrollumfang)}" placeholder="z.B. Gesamte Installation Wohnhaus"></div>
+      <div class="narrow" style="flex:0 0 200px"><label class="f">Geplantes Kontrolldatum</label><input type="date" id="k_plan" value="${esc(ku.planDatum)}"></div>
     </div>
   </div>
   <div class="card">
     <h3 style="margin-top:0">Ort der Anlage</h3>
     <div class="row">
       <div><label class="f">Gebäudeart</label><input type="text" id="k_geb" list="gebliste" value="${esc(ku.gebaeudeart)}"><datalist id="gebliste">${gebOpts}</datalist></div>
-      <div><label class="f">Zählernummer</label><input type="text" id="k_zaehler" value="${esc(ku.zaehler)}"></div>
+      <div><label class="f">VNB (Verteilnetzbetreiber, z.B. BKW, EWB)</label><input type="text" id="k_zaehler" value="${esc(ku.zaehler)}"></div>
     </div>
     <div class="row">
       <div style="flex:2"><label class="f">Strasse, Nr.</label><input type="text" id="k_str" value="${esc(ku.strasse)}"></div>
@@ -302,6 +337,7 @@ function renderKunde() {
   </div>
   <div class="card">
     <h3 style="margin-top:0">Eigentümer</h3>
+    <div class="btnrow" style="margin-top:0"><button class="btn small" id="btnCopyAdr">⤵ Adresse der Anlage übernehmen</button></div>
     <div class="row">
       <div><label class="f">Name</label><input type="text" id="k_ename" value="${esc(ku.eigName)}"></div>
       <div><label class="f">Telefon</label><input type="text" id="k_etel" inputmode="tel" value="${esc(ku.eigTel)}"></div>
@@ -325,7 +361,7 @@ function renderKunde() {
     </div>
   </div>`;
   const map = {
-    k_anr: 'auftragNr', k_abez: 'auftragBez', k_kumf: 'kontrollumfang',
+    k_anr: 'auftragNr', k_abez: 'auftragBez', k_kumf: 'kontrollumfang', k_plan: 'planDatum',
     k_geb: 'gebaeudeart', k_zaehler: 'zaehler', k_str: 'strasse', k_plz: 'plz', k_ort: 'ort', k_bem: 'bemerkung',
     k_ename: 'eigName', k_etel: 'eigTel', k_email: 'eigMail', k_estr: 'eigStrasse', k_eplz: 'eigPlz', k_eort: 'eigOrt',
     k_rname: 'rechName', k_rstr: 'rechStrasse', k_rplz: 'rechPlz', k_rort: 'rechOrt'
@@ -338,26 +374,33 @@ function renderKunde() {
     $('#rechblock').style.display = ku.rechAbw ? 'block' : 'none';
     save();
   });
+  $('#btnCopyAdr').addEventListener('click', () => {
+    ku.eigStrasse = ku.strasse;
+    ku.eigPlz = ku.plz;
+    ku.eigOrt = ku.ort;
+    save();
+    renderKunde();
+  });
 }
 
 /* ============================================================
-   Ansicht: Verteiler (UV) + Gruppen erfassen
+   Ansicht: Anlagen (intern «uv») + Gruppen erfassen
    ============================================================ */
 
 function uvChips(onSwitch) {
   const k = S.kontrolle;
   let html = `<div class="chips">`;
   for (const uv of k.uvs) {
-    html += `<button class="chip ${uv.id === S.uvId ? 'active' : ''}" data-uvid="${uv.id}">${esc(uv.name || 'UV ohne Name')}</button>`;
+    html += `<button class="chip ${uv.id === S.uvId ? 'active' : ''}" data-uvid="${uv.id}">${esc(uv.name || 'Anlage ohne Name')}</button>`;
   }
-  html += `<button class="chip add" id="chipAddUv">＋ UV</button></div>`;
+  html += `<button class="chip add" id="chipAddUv">＋ Anlage</button></div>`;
   return {
     html,
     wire() {
       $$('.chip[data-uvid]').forEach(c => c.addEventListener('click', () => { S.uvId = c.dataset.uvid; onSwitch(); }));
       const add = $('#chipAddUv');
       if (add) add.addEventListener('click', () => {
-        const uv = newUv('UV ' + (k.uvs.length + 1));
+        const uv = newUv('Anlage ' + (k.uvs.length + 1));
         k.uvs.push(uv); S.uvId = uv.id; save(); onSwitch();
       });
     }
@@ -391,18 +434,31 @@ function renderUvView() {
   const v = $('#view');
   const chips = uvChips(() => renderUvView());
   const uv = curUv();
-  let html = `<h2>Unterverteilungen</h2>${chips.html}`;
+  const k = S.kontrolle;
+  const hakCard = `<div class="card">
+    <label class="f" style="margin-top:0">HAK (Hausanschlusskasten) – einer pro Gebäude</label>
+    <input type="text" id="hakfeld" value="${esc(k.hak || '')}" placeholder="z.B. DIII 60 A, IK 950 A">
+  </div>`;
+  let html = `<h2>Anlagen</h2>${hakCard}${chips.html}`;
   if (!uv) {
-    html += `<div class="empty">Noch keine Unterverteilung. Tippe auf <b>＋ UV</b>.</div>`;
-    v.innerHTML = html; chips.wire(); return;
+    html += `<div class="empty">Noch keine Anlage. Tippe auf <b>＋ Anlage</b>.</div>`;
+    v.innerHTML = html;
+    chips.wire();
+    bindInput($('#hakfeld'), k, 'hak');
+    return;
   }
+  const inspChips = (SETTINGS.inspektoren || []).length
+    ? (SETTINGS.inspektoren || []).map(i => `<button class="chip ${(uv.geprueft || []).includes(i.kuerzel) ? 'active' : ''}" data-kz="${esc(i.kuerzel)}" title="${esc(i.name)}">${esc(i.kuerzel)}</button>`).join('')
+    : '<span class="hint" style="display:inline">Zuerst unter ⚙️ Optionen Inspektoren erfassen.</span>';
   html += `<div class="card">
     <div class="row">
-      <div><label class="f">Name der UV</label><input type="text" id="uv_name" value="${esc(uv.name)}" placeholder="z.B. UV Wohnung EG"></div>
-      <div><label class="f">Ort der UV</label><input type="text" id="uv_ort" value="${esc(uv.ort)}" placeholder="z.B. Flur EG"></div>
+      <div><label class="f">Name der Anlage</label><input type="text" id="uv_name" value="${esc(uv.name)}" placeholder="z.B. UV Wohnung EG"></div>
+      <div><label class="f">Zählernummer</label><input type="text" id="uv_ort" value="${esc(uv.ort)}" placeholder="z.B. 10096600"></div>
       <div><label class="f">Stromkunde (Mieter/Bewohner)</label><input type="text" id="uv_kunde" value="${esc(uv.stromkunde)}"></div>
     </div>
-    <div class="btnrow" style="margin-top:12px"><button class="btn danger small" id="btnDelUv">UV löschen</button></div>
+    <label class="f">Geprüft durch</label>
+    <div class="chips" id="gepChips" style="margin-bottom:4px">${inspChips}</div>
+    <div class="btnrow" style="margin-top:12px"><button class="btn danger small" id="btnDelUv">Anlage löschen</button></div>
   </div>
 
   <div class="card">
@@ -414,19 +470,29 @@ function renderUvView() {
 
   <div class="card">
     <h3 style="margin-top:0">Gruppen (${uv.gruppen.length})</h3>
-    <div class="hint">Die erste Zeile ist die <b>Zuleitung der UV</b> – ihr «IK Ende» wird automatisch als «IK Anfang» aller anderen Gruppen übernommen.</div>
+    <div class="hint">Die erste Zeile ist die <b>Zuleitung der Anlage</b> – ihr «IK Ende» wird automatisch als «IK Anfang» aller anderen Gruppen übernommen.</div>
     <div id="glist"></div>
     <div class="btnrow"><button class="btn" id="btnAddG">＋ Zeile hinzufügen</button></div>
   </div>`;
   v.innerHTML = html;
   chips.wire();
 
+  bindInput($('#hakfeld'), k, 'hak');
   bindInput($('#uv_name'), uv, 'name');
   bindInput($('#uv_ort'), uv, 'ort');
   bindInput($('#uv_kunde'), uv, 'stromkunde');
 
+  $$('#gepChips .chip').forEach(ch => ch.addEventListener('click', () => {
+    const kz = ch.dataset.kz;
+    uv.geprueft = uv.geprueft || [];
+    if (uv.geprueft.includes(kz)) uv.geprueft = uv.geprueft.filter(x => x !== kz);
+    else uv.geprueft.push(kz);
+    ch.classList.toggle('active');
+    save();
+  }));
+
   $('#btnDelUv').addEventListener('click', () => {
-    if (!confirm(`UV «${uv.name || 'ohne Name'}» mit allen Gruppen löschen?`)) return;
+    if (!confirm(`Anlage «${uv.name || 'ohne Name'}» mit allen Gruppen löschen?`)) return;
     S.kontrolle.uvs = S.kontrolle.uvs.filter(u => u.id !== uv.id);
     S.uvId = S.kontrolle.uvs.length ? S.kontrolle.uvs[0].id : null;
     save(); renderUvView();
@@ -496,7 +562,7 @@ function renderFill() {
   const uv = curUv();
   let html = `<h2>Schnell-Ausfüllen</h2>${chips.html}`;
   if (!uv || uv.gruppen.length === 0) {
-    html += `<div class="empty">Zuerst unter <b>🔌 Verteiler</b> Gruppen erfassen.</div>`;
+    html += `<div class="empty">Zuerst unter <b>🔌 Anlagen</b> Gruppen erfassen.</div>`;
     v.innerHTML = html; chips.wire(); return;
   }
   if (!S.fillGid || !uv.gruppen.some(g => g.id === S.fillGid)) S.fillGid = uv.gruppen[0].id;
@@ -607,13 +673,13 @@ function renderMess() {
   const uv = curUv();
   let html = `<h2>Messwerte erfassen</h2>${chips.html}`;
   if (!uv || uv.gruppen.length === 0) {
-    html += `<div class="empty">Zuerst unter <b>🔌 Verteiler</b> Gruppen erfassen.</div>`;
+    html += `<div class="empty">Zuerst unter <b>🔌 Anlagen</b> Gruppen erfassen.</div>`;
     v.innerHTML = html; chips.wire(); return;
   }
   html += `<div class="btnrow">
       <button class="btn primary" id="btnMangel">⚠️ Mangel erfassen</button>
     </div>
-    <div class="hint">Gelbe Zeile = Zuleitung der UV. Trägst du dort <b>IK Ende</b> ein, wird der Wert automatisch als <b>IK Anfang</b> in alle Gruppen darunter übernommen (nur leere bzw. automatisch gefüllte Felder werden überschrieben).</div>
+    <div class="hint">Gelbe Zeile = Zuleitung der Anlage. Trägst du dort <b>IK Ende</b> ein, wird der Wert automatisch als <b>IK Anfang</b> in alle Gruppen darunter übernommen (nur leere bzw. automatisch gefüllte Felder werden überschrieben).</div>
     <div class="tablewrap"><table class="mess">
     <colgroup>${MESS_COLS.map(c => `<col style="width:${c.w}%">`).join('')}</colgroup>
     <thead><tr>${MESS_COLS.map(c => `<th class="${c.cls || ''}">${c.label}</th>`).join('')}</tr></thead>
@@ -682,8 +748,8 @@ async function renderMaengel() {
       ${S.returnView ? '<button class="btn" id="btnBack">← Zurück zum Messen</button>' : ''}
     </div>`;
   if (!k.maengel.length) html += `<div class="empty">Keine Mängel erfasst. Sehr schön! 🎉</div>`;
-  const uvOpts = uvId => ['<option value="">– UV wählen –</option>']
-    .concat(k.uvs.map(u => `<option value="${u.id}" ${u.id === uvId ? 'selected' : ''}>${esc(u.name || 'UV ohne Name')}</option>`)).join('');
+  const uvOpts = uvId => ['<option value="">– Anlage wählen –</option>']
+    .concat(k.uvs.map(u => `<option value="${u.id}" ${u.id === uvId ? 'selected' : ''}>${esc(u.name || 'Anlage ohne Name')}</option>`)).join('');
   let mNr = 0;
   k.maengel.forEach(m => {
     const info = istInfo(m);
@@ -698,7 +764,7 @@ async function renderMaengel() {
             <button class="t_info ${info ? 'on' : ''}">ℹ️ Info</button>
           </div>
         </div>
-        <div><label class="f">Unterverteilung</label><select class="m_uv">${uvOpts(m.uvId)}</select></div>
+        <div><label class="f">Anlage</label><select class="m_uv">${uvOpts(m.uvId)}</select></div>
         <div><label class="f">Ort (Zimmer, Anlageteil)</label><input type="text" class="m_ort" value="${esc(m.ort)}"></div>
       </div>
       ${info ? `<label class="f">Textbaustein einfügen</label>
@@ -842,16 +908,16 @@ function resizePhoto(file, maxDim = 1600, quality = 0.82) {
 function renderExport() {
   const v = $('#view');
   const k = S.kontrolle;
-  let html = `<h2>Export</h2>`;
+  let html = `<h2>Abschluss</h2>`;
   if (!k.uvs.length) {
-    html += `<div class="hint warntext">Noch keine Unterverteilungen erfasst.</div>`;
+    html += `<div class="hint warntext">Noch keine Anlagen erfasst.</div>`;
   }
   html += `<div class="card">
-    <h3 style="margin-top:0">Messdaten pro UV</h3>
+    <h3 style="margin-top:0">Messdaten pro Anlage</h3>
     <label class="f"><input type="checkbox" id="csvHeader" ${S.csvHeader ? 'checked' : ''} style="width:auto;margin-right:8px">Kopfzeile im CSV einschliessen</label>
     ${k.uvs.map(uv => `
       <div class="row" style="align-items:center;margin-top:10px" data-uvid="${uv.id}">
-        <div style="flex:1;font-weight:600">${esc(uv.name || 'UV ohne Name')} <span class="hint" style="display:inline">(${uv.gruppen.length} Zeilen)</span></div>
+        <div style="flex:1;font-weight:600">${esc(uv.name || 'Anlage ohne Name')} <span class="hint" style="display:inline">(${uv.gruppen.length} Zeilen)</span></div>
         <button class="btn small" data-act="copy">📋 CSV kopieren</button>
         <button class="btn small" data-act="csv">⬇︎ CSV-Datei</button>
         <button class="btn small" data-act="skx">⬇︎ SKX (ElektroForm)</button>
@@ -859,18 +925,27 @@ function renderExport() {
   </div>
   <div class="card">
     <h3 style="margin-top:0">Kontrollbericht (PDF)</h3>
-    <div class="hint">Anhaken, welche Verteiler <b>zusammen in einen Bericht</b> kommen – für Einzelberichte jeweils nur einen anwählen und erneut drucken. Auf dem iPad: <b>Drucken → in der Vorschau «Als PDF sichern»</b> (oder Teilen-Symbol im Druckdialog). Der Dateiname wird automatisch gesetzt: <i>Kontrollbericht_UV Name_Strasse_Ort</i>.</div>
+    <div class="hint">Anhaken, welche Anlagen <b>zusammen in einen Bericht</b> kommen – für Einzelberichte jeweils nur eine anwählen und erneut drucken. Auf dem iPad: <b>Drucken → in der Vorschau «Als PDF sichern»</b> (oder Teilen-Symbol im Druckdialog). Der Dateiname wird automatisch gesetzt: <i>Kontrollbericht_Anlage_Strasse_Ort</i>.</div>
     <div id="rptsel">
     ${k.uvs.map(uv => {
       const nm = k.maengel.filter(m => m.uvId === uv.id && !istInfo(m)).length;
       const ni = k.maengel.filter(m => m.uvId === uv.id && istInfo(m)).length;
-      return `<label class="f rptselrow"><input type="checkbox" class="rptuvsel" value="${uv.id}" checked style="width:auto;margin-right:8px">${esc(uv.name || 'UV ohne Name')}${uv.ort ? ' – ' + esc(uv.ort) : ''} <span class="hint" style="display:inline">(${nm} ${nm === 1 ? 'Mangel' : 'Mängel'}${ni ? ', ' + ni + ' Info' : ''})</span></label>`;
+      return `<label class="f rptselrow"><input type="checkbox" class="rptuvsel" value="${uv.id}" checked style="width:auto;margin-right:8px">${esc(uv.name || 'Anlage ohne Name')}${uv.ort ? ' – Zähler ' + esc(uv.ort) : ''} <span class="hint" style="display:inline">(${nm} ${nm === 1 ? 'Mangel' : 'Mängel'}${ni ? ', ' + ni + ' Info' : ''})</span></label>`;
     }).join('')}
     ${(() => {
       const n = k.maengel.filter(m => !k.uvs.some(u => u.id === m.uvId)).length;
-      return n ? `<label class="f rptselrow"><input type="checkbox" id="rptohne" checked style="width:auto;margin-right:8px">Allgemeine Einträge (ohne Verteiler) <span class="hint" style="display:inline">(${n})</span></label>` : '';
+      return n ? `<label class="f rptselrow"><input type="checkbox" id="rptohne" checked style="width:auto;margin-right:8px">Allgemeine Einträge (ohne Anlage) <span class="hint" style="display:inline">(${n})</span></label>` : '';
     })()}
     </div>
+    <label class="f">Inspektor(en) im Bericht</label>
+    ${(() => {
+      const insps = SETTINGS.inspektoren || [];
+      if (!insps.length) return '<div class="hint">Keine Inspektoren erfasst – bitte unter ⚙️ Optionen anlegen.</div>';
+      const union = new Set();
+      k.uvs.forEach(uv => (uv.geprueft || []).forEach(kz => union.add(kz)));
+      return `<div id="rptinsp">${insps.map(i =>
+        `<label class="f rptselrow"><input type="checkbox" class="rptinspsel" value="${esc(i.kuerzel)}" ${union.has(i.kuerzel) ? 'checked' : ''} style="width:auto;margin-right:8px">${esc(i.kuerzel)} – ${esc(i.name)}</label>`).join('')}</div>`;
+    })()}
     <div class="btnrow">
       <button class="btn primary" id="btnReport">🖨 Bericht erstellen &amp; drucken</button>
       <button class="btn" id="btnMailKunde">✉️ Mail an Kunde</button>
@@ -878,10 +953,23 @@ function renderExport() {
     <div class="hint">«Mail an Kunde» öffnet ein neues Mail an <b>${esc(k.kunde.eigMail || '(keine E-Mail beim Eigentümer erfasst)')}</b> mit Betreff und Text – das gesicherte Bericht-PDF dort noch anhängen. Die Adresse lässt sich im Mail manuell ändern.</div>
   </div>
   <div class="card">
-    <h3 style="margin-top:0">Abschluss &amp; Übergabe</h3>
-    <div class="row">
-      <div class="narrow" style="flex:0 0 220px"><label class="f">Aufgewendete Arbeitszeit</label><input type="text" id="e_zeit" value="${esc(k.arbeitszeit)}" placeholder="z.B. 3.5 h"></div>
+    <h3 style="margin-top:0">Status &amp; Übergabe</h3>
+    <label class="f">Status der Kontrolle ${furthestStatus(k) ? '– aktuell: <b>' + esc(furthestStatus(k)) + '</b>' : ''}</label>
+    <div class="chips" id="statusChips" style="margin-bottom:6px">
+      ${STATUS_STUFEN.map(s => `<button class="chip ${furthestStatus(k) === s ? 'active' : ''}" data-status="${s}">${s}</button>`).join('')}
     </div>
+    <div id="statusPick" style="display:none"></div>
+    ${(k.statusLog || []).length ? `<div class="hint">${k.statusLog.slice().reverse().map(e => `<b>${esc(e.status)}</b> – ${esc(e.kz)}, ${fmtDate(e.ts)}`).join('<br>')}</div>` : ''}
+    <label class="f">Arbeitszeiten ${(k.zeitLog || []).length ? '– Total: <b>' + esc(zeitTotal(k)) + '</b>' : ''}</label>
+    ${(k.zeitLog || []).length
+      ? `<div class="hint">${(k.zeitLog || []).map((e, i) => ({ e, i })).reverse().map(x =>
+          `<b>${esc(x.e.zeit)}</b> – ${esc(x.e.kz)}, ${fmtDate(x.e.ts)} <button class="zdel" data-i="${x.i}">✕</button>`).join('<br>')}</div>`
+      : (k.arbeitszeit ? `<div class="hint">Früher erfasst: <b>${esc(k.arbeitszeit)}</b></div>` : '')}
+    <div class="row" style="align-items:flex-end">
+      <div class="narrow" style="flex:0 0 220px"><label class="f">Zeit erfassen</label><input type="text" id="e_zeit" inputmode="decimal" placeholder="z.B. 3.5 h"></div>
+      <div class="narrow" style="flex:0 0 auto"><button class="btn" id="btnAddZeit">＋ Erfassen</button></div>
+    </div>
+    <div id="zeitPick" style="display:none"></div>
     <div class="hint">Sendet <b>diese Kontrolle</b> als Datei – mit allen Daten, Fotos und der Arbeitszeit. So kann eine vorbereitete Kontrolle an den Mitarbeiter gehen und die fertige wieder zurück. Der Empfänger importiert die Datei unten bei «Backup importieren». «Teilen» öffnet auf dem iPad das Teilen-Menü (Mail, AirDrop, …) mit der Datei im Anhang.</div>
     <div class="btnrow">
       <button class="btn primary" id="btnShareK">✉️ Kontrolle teilen / per Mail senden</button>
@@ -925,11 +1013,36 @@ function renderExport() {
     const ohneBox = $('#rptohne');
     const includeOhne = ohneBox ? ohneBox.checked : true;
     if (k.uvs.length && !uvIds.length && !includeOhne) {
-      alert('Bitte mindestens einen Verteiler anwählen.');
+      alert('Bitte mindestens eine Anlage anwählen.');
       return;
     }
-    showReport({ uvIds, includeOhne });
+    const inspKuerzel = $$('.rptinspsel:checked').map(c => c.value);
+    showReport({ uvIds, includeOhne, inspKuerzel });
   });
+
+  $$('#statusChips .chip').forEach(ch => ch.addEventListener('click', () => {
+    const status = ch.dataset.status;
+    if (status === 'Gemessen' && !(k.hak || '').trim()) {
+      if (!confirm('Hinweis: Das HAK-Feld (Hausanschlusskasten) im Reiter Anlagen ist noch leer.\n\nStatus «Gemessen» trotzdem setzen?')) return;
+    }
+    const insps = SETTINGS.inspektoren || [];
+    if (!insps.length) {
+      const kz = (prompt(`Status «${status}» setzen – dein Kürzel:`) || '').trim();
+      if (!kz) return;
+      setStatus(k, status, kz.toUpperCase());
+      renderExport();
+      return;
+    }
+    const box = $('#statusPick');
+    box.style.display = '';
+    box.innerHTML = `<div class="hint">Status «${esc(status)}» setzen als:</div><div class="chips">`
+      + insps.map(i => `<button class="chip" data-kz="${esc(i.kuerzel)}">${esc(i.kuerzel)}</button>`).join('')
+      + `<button class="chip" data-kz="">✕ Abbrechen</button></div>`;
+    box.querySelectorAll('.chip').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.kz) { setStatus(k, status, b.dataset.kz); renderExport(); }
+      else { box.style.display = 'none'; box.innerHTML = ''; }
+    }));
+  }));
 
   $('#btnMailKunde').addEventListener('click', () => {
     const ku = k.kunde;
@@ -939,7 +1052,41 @@ function renderExport() {
     location.href = `mailto:${encodeURIComponent(ku.eigMail || '')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   });
 
-  bindInput($('#e_zeit'), k, 'arbeitszeit');
+  $('#btnAddZeit').addEventListener('click', () => {
+    const val = $('#e_zeit').value.trim();
+    if (!val) { alert('Bitte zuerst die Zeit eintragen (z.B. 3.5 h).'); return; }
+    const apply = kz => {
+      (k.zeitLog = k.zeitLog || []).push({ zeit: val, kz, ts: Date.now() });
+      save();
+      renderExport();
+    };
+    const insps = SETTINGS.inspektoren || [];
+    if (!insps.length) {
+      const kz = (prompt(`Zeit «${val}» erfassen – dein Kürzel:`) || '').trim();
+      if (!kz) return;
+      apply(kz.toUpperCase());
+      return;
+    }
+    const box = $('#zeitPick');
+    box.style.display = '';
+    box.innerHTML = `<div class="hint">Zeit «${esc(val)}» erfassen als:</div><div class="chips">`
+      + insps.map(i => `<button class="chip" data-kz="${esc(i.kuerzel)}">${esc(i.kuerzel)}</button>`).join('')
+      + `<button class="chip" data-kz="">✕ Abbrechen</button></div>`;
+    box.querySelectorAll('.chip').forEach(b => b.addEventListener('click', () => {
+      if (b.dataset.kz) apply(b.dataset.kz);
+      else { box.style.display = 'none'; box.innerHTML = ''; }
+    }));
+  });
+
+  $$('.zdel').forEach(b => b.addEventListener('click', () => {
+    const i = Number(b.dataset.i);
+    const e = (k.zeitLog || [])[i];
+    if (!e) return;
+    if (!confirm(`Zeiteintrag «${e.zeit} – ${e.kz}» löschen?`)) return;
+    k.zeitLog.splice(i, 1);
+    save();
+    renderExport();
+  }));
 
   $('#btnShareK').addEventListener('click', async () => {
     try {
@@ -1085,7 +1232,7 @@ async function showReport(sel) {
   const heute = new Date().toLocaleDateString('de-CH');
   const dash = s => esc(s || '–');
 
-  // Auswahl: welche Verteiler in diesen Bericht kommen (Standard: alle)
+  // Auswahl: welche Anlagen in diesen Bericht kommen (Standard: alle)
   const uvIds = sel && sel.uvIds ? sel.uvIds : k.uvs.map(u => u.id);
   const inclOhne = sel ? !!sel.includeOhne : true;
   const inclUvs = k.uvs.filter(u => uvIds.includes(u.id));
@@ -1094,8 +1241,15 @@ async function showReport(sel) {
   const mangelItems = k.maengel.filter(m => !istInfo(m) && inBericht(m));
   const infoItems = k.maengel.filter(m => istInfo(m) && inBericht(m));
   const mCount = mangelItems.length;
-  const uvNamen = inclUvs.map(u => u.name || 'UV ohne Name')
+  const uvNamen = inclUvs.map(u => (u.name || 'Anlage ohne Name') + (u.ort ? ' (Zähler ' + u.ort + ')' : ''))
     .concat(inclOhne && k.maengel.some(istOhneUv) ? ['Allgemein'] : []);
+
+  // Inspektoren für diesen Bericht (aus der Auswahl im Abschluss)
+  const selKz = (sel && sel.inspKuerzel) ? sel.inspKuerzel : [];
+  let inspektoren = (SETTINGS.inspektoren || []).filter(i => selKz.includes(i.kuerzel));
+  if (!inspektoren.length && SETTINGS.inspName) {
+    inspektoren = [{ kuerzel: '', name: SETTINGS.inspName, tel: SETTINGS.inspTel, mail: SETTINGS.inspMail }];
+  }
 
   let html = `<div class="rpthead">
     <div class="rpttitle"><h1>Kontrollbericht</h1><div>Nummer&nbsp;&nbsp;<b>${dash(ku.auftragNr)}</b></div></div>
@@ -1113,18 +1267,18 @@ async function showReport(sel) {
       </tr>
       <tr>
         <td class="lbl">Auftragsbezeichnung</td><td>${dash(ku.auftragBez)}</td>
-        <td class="lbl">Zähler-Nr.</td><td>${dash(ku.zaehler)}</td>
+        <td class="lbl">VNB</td><td>${dash(ku.zaehler)}</td>
       </tr>
       <tr>
         <td class="lbl">Kontrollumfang</td><td>${dash(ku.kontrollumfang)}</td>
-        <td class="lbl">Verteiler</td>
+        <td class="lbl">Anlage(n)</td>
         <td>${uvNamen.length ? esc(uvNamen.join(', ')) : '–'}</td>
       </tr>
       <tr>
         <td class="lbl">Kontrolle am / durch</td>
-        <td>${esc(heute)}, ${dash(SETTINGS.inspName)}</td>
+        <td>${esc(heute)}<br>${inspektoren.length ? inspektoren.map(i => esc(i.name || i.kuerzel)).join('<br>') : '–'}</td>
         <td class="lbl">Tel. / E-Mail</td>
-        <td>${esc(SETTINGS.inspTel || '–')}<br>${esc(SETTINGS.inspMail || '')}</td>
+        <td>${inspektoren.length ? inspektoren.map(i => esc([i.tel, i.mail].filter(Boolean).join(' · ') || '–')).join('<br>') : '–'}</td>
       </tr>
       <tr>
         <td class="lbl">Mängel</td>
@@ -1141,10 +1295,10 @@ async function showReport(sel) {
     const gruppen = [];
     for (const uv of inclUvs) {
       const ms = mangelItems.filter(m => m.uvId === uv.id);
-      if (ms.length) gruppen.push({ titel: [uv.name || 'UV ohne Name', uv.ort].filter(Boolean).join(' – '), ms });
+      if (ms.length) gruppen.push({ titel: (uv.name || 'Anlage ohne Name') + (uv.ort ? ' – Zähler ' + uv.ort : ''), ms });
     }
     const ohne = mangelItems.filter(istOhneUv);
-    if (ohne.length) gruppen.push({ titel: 'Allgemein / ohne Verteiler', ms: ohne });
+    if (ohne.length) gruppen.push({ titel: 'Allgemein / ohne Anlage', ms: ohne });
 
     let nr = 0;
     for (const grp of gruppen) {
@@ -1166,7 +1320,7 @@ async function showReport(sel) {
   }
 
   if (infoItems.length) {
-    const uvNameById = id => { const u = k.uvs.find(x => x.id === id); return u ? (u.name || 'UV ohne Name') : ''; };
+    const uvNameById = id => { const u = k.uvs.find(x => x.id === id); return u ? (u.name || 'Anlage ohne Name') : ''; };
     html += `<h2 class="rptsection">Information</h2>`;
     for (const m of infoItems) {
       let fotosHtml = '';
@@ -1191,7 +1345,7 @@ async function showReport(sel) {
 
   html += `<div class="rptsig">
       <span>Datum&nbsp; <b>${esc(heute)}</b></span>
-      <span>Unterschrift&nbsp; <b>${dash(SETTINGS.inspName)}</b>&nbsp;${sigImg || '<span class="sigline"></span>'}</span>
+      <span>Unterschrift&nbsp; <b>${inspektoren.length ? esc(inspektoren.map(i => i.name || i.kuerzel).join(' / ')) : '–'}</b>&nbsp;${sigImg || '<span class="sigline"></span>'}</span>
     </div>`;
 
   if (mCount) {
@@ -1209,7 +1363,7 @@ async function showReport(sel) {
   // Dateiname: Kontrollbericht_UV Name_Strasse_Ort (wird beim «Als PDF sichern» übernommen)
   let uvPart;
   if (!k.uvs.length) uvPart = uvNamen.join('+') || 'Kontrolle';
-  else if (inclUvs.length === k.uvs.length) uvPart = k.uvs.length > 1 ? 'alle UV' : (inclUvs[0].name || 'UV');
+  else if (inclUvs.length === k.uvs.length) uvPart = k.uvs.length > 1 ? 'alle Anlagen' : (inclUvs[0].name || 'Anlage');
   else uvPart = inclUvs.map(u => u.name || 'UV').join('+') || 'Allgemein';
   const fname = ['Kontrollbericht', fnSan(uvPart), fnSan(ku.strasse), fnSan(ku.ort)].filter(Boolean).join('_');
   const oldTitle = document.title;
@@ -1285,24 +1439,28 @@ async function importBackup(e) {
 function renderSettings() {
   const v = $('#view');
   const qsLines = Object.entries(SETTINGS.querschnitt).map(([a, q]) => `${a}=${q}`).join('\n');
+  // Migration: alter Einzel-Inspekteur (bis v1.4) wird als erste Zeile vorgeschlagen
+  let inspZeilen = (SETTINGS.inspektoren || []).map(i => [i.kuerzel, i.name, i.tel, i.mail].join('; ')).join('\n');
+  if (!inspZeilen && SETTINGS.inspName) {
+    const kz = SETTINGS.inspName.split(/\s+/).map(w => w[0] || '').join('').toUpperCase();
+    inspZeilen = [kz, SETTINGS.inspName, SETTINGS.inspTel, SETTINGS.inspMail].join('; ');
+  }
   const area = (id, label, val, hint) => `
     <label class="f">${label}</label>
     ${hint ? `<div class="hint">${hint}</div>` : ''}
     <textarea id="${id}" spellcheck="false">${esc(val)}</textarea>`;
   v.innerHTML = `<h2>Einstellungen</h2>
   <div class="card">
-    <h3 style="margin-top:0">Ausführende Firma &amp; Inspekteur</h3>
+    <h3 style="margin-top:0">Ausführende Firma &amp; Inspektoren</h3>
     <div class="hint">Erscheint im Kopf des Kontrollberichts (Auftragnehmer / «Kontrolle durch»).</div>
     <div class="row">
       <div><label class="f">Firma</label><input type="text" id="s_fname" value="${esc(SETTINGS.firmaName)}" placeholder="z.B. Elektro Burkhalter AG"></div>
       <div><label class="f">Strasse, Nr.</label><input type="text" id="s_fstr" value="${esc(SETTINGS.firmaStrasse)}"></div>
       <div><label class="f">PLZ / Ort</label><input type="text" id="s_fplzort" value="${esc(SETTINGS.firmaPlzOrt)}"></div>
     </div>
-    <div class="row">
-      <div><label class="f">Inspekteur (Name)</label><input type="text" id="s_iname" value="${esc(SETTINGS.inspName)}"></div>
-      <div><label class="f">Telefon</label><input type="text" id="s_itel" inputmode="tel" value="${esc(SETTINGS.inspTel)}"></div>
-      <div><label class="f">E-Mail</label><input type="text" id="s_imail" inputmode="email" value="${esc(SETTINGS.inspMail)}"></div>
-    </div>
+    <label class="f">Inspektoren – einer pro Zeile, Angaben mit Strichpunkt getrennt: <b>Kürzel; Name; Telefon; E-Mail</b></label>
+    <div class="hint">Beispiel: <b>GK; Gabriel Kloter; 031 996 33 26; gabriel@firma.ch</b> – die Kürzel stehen dann bei den Anlagen («Geprüft durch») und beim Status zur Auswahl.</div>
+    <textarea id="s_insp" spellcheck="false" placeholder="GK; Gabriel Kloter; 031 996 33 26; gabriel@firma.ch">${esc(inspZeilen)}</textarea>
     <label class="f">Text zur Mängelerledigung (erscheint unten im Bericht über dem Unterschriftsfeld)</label>
     <textarea id="s_erltext">${esc(SETTINGS.erledigungsText)}</textarea>
     <label class="f">Info-Textbausteine (für den Informationsteil im Bericht)</label>
@@ -1337,7 +1495,7 @@ function renderSettings() {
     </div>
   </div>
   <div class="card">
-    <div class="hint">App-Version: <span id="appver">1.4</span> · Daten werden lokal auf diesem Gerät gespeichert (IndexedDB). Regelmässig unter <b>📤 Export</b> ein Backup sichern!</div>
+    <div class="hint">App-Version: <span id="appver">1.8</span> · Daten werden lokal auf diesem Gerät gespeichert (IndexedDB). Regelmässig unter <b>📤 Export</b> ein Backup sichern!</div>
   </div>`;
 
   const paintSig = async () => {
@@ -1389,9 +1547,16 @@ function renderSettings() {
     SETTINGS.firmaName = $('#s_fname').value.trim();
     SETTINGS.firmaStrasse = $('#s_fstr').value.trim();
     SETTINGS.firmaPlzOrt = $('#s_fplzort').value.trim();
-    SETTINGS.inspName = $('#s_iname').value.trim();
-    SETTINGS.inspTel = $('#s_itel').value.trim();
-    SETTINGS.inspMail = $('#s_imail').value.trim();
+    SETTINGS.inspektoren = $('#s_insp').value.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+      const p = l.split(';').map(x => x.trim());
+      return { kuerzel: (p[0] || '').toUpperCase(), name: p[1] || '', tel: p[2] || '', mail: p[3] || '' };
+    }).filter(i => i.kuerzel);
+    // Kompatibilität: erster Inspektor füllt weiterhin die alten Einzelfelder (Mail-Signatur, Fallbacks)
+    if (SETTINGS.inspektoren[0]) {
+      SETTINGS.inspName = SETTINGS.inspektoren[0].name;
+      SETTINGS.inspTel = SETTINGS.inspektoren[0].tel;
+      SETTINGS.inspMail = SETTINGS.inspektoren[0].mail;
+    }
     SETTINGS.erledigungsText = $('#s_erltext').value.trim();
     SETTINGS.infoTexte = $('#s_info').value.split(/^\s*---\s*$/m).map(t => t.trim()).filter(Boolean);
     await saveSettings();
@@ -1409,7 +1574,34 @@ function renderSettings() {
    Start
    ============================================================ */
 
+/* ---- Vollbild-Knopf (Topbar) ---- */
+
+function initFullscreen() {
+  const btn = $('#fsbtn');
+  const root = document.documentElement;
+  const supported = !!(root.requestFullscreen || root.webkitRequestFullscreen);
+  if (!supported) { btn.style.display = 'none'; return; }
+  const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const paint = () => {
+    btn.classList.toggle('active', !!fsEl());
+    btn.textContent = fsEl() ? '✕' : '⛶';
+    btn.title = fsEl() ? 'Vollbild verlassen' : 'Vollbild';
+  };
+  btn.addEventListener('click', () => {
+    try {
+      const p = fsEl()
+        ? (document.exitFullscreen || document.webkitExitFullscreen).call(document)
+        : (root.requestFullscreen || root.webkitRequestFullscreen).call(root);
+      if (p && p.catch) p.catch(() => {}); // z.B. nicht erlaubt – Knopf bleibt wirkungslos
+    } catch (e) { /* dito für synchrone Ablehnung */ }
+  });
+  document.addEventListener('fullscreenchange', paint);
+  document.addEventListener('webkitfullscreenchange', paint);
+  paint();
+}
+
 async function init() {
+  initFullscreen();
   db = await openDB();
   const stored = await dbGet('kv', 'settings');
   if (stored) SETTINGS = Object.assign({}, DEFAULT_SETTINGS, stored);
