@@ -948,9 +948,9 @@ function renderExport() {
     })()}
     <div class="btnrow">
       <button class="btn primary" id="btnReport">🖨 Bericht erstellen &amp; drucken</button>
-      <button class="btn" id="btnMailKunde">✉️ Mail an Kunde</button>
+      <button class="btn" id="btnMailKunde">✉️ Bericht per Mail senden</button>
     </div>
-    <div class="hint">«Mail an Kunde» öffnet ein neues Mail an <b>${esc(k.kunde.eigMail || '(keine E-Mail beim Eigentümer erfasst)')}</b> mit Betreff und Text – das gesicherte Bericht-PDF dort noch anhängen. Die Adresse lässt sich im Mail manuell ändern.</div>
+    <div class="hint">«Bericht per Mail senden» erstellt das PDF (mit den oben angehakten Anlagen und Inspektoren) und öffnet das Teilen-Menü – dort <b>Mail</b> wählen: <b>der Bericht ist bereits angehängt</b>. Die Kundenadresse <b>${esc(k.kunde.eigMail || '(keine E-Mail beim Eigentümer erfasst)')}</b> wird in die Zwischenablage kopiert – im Mail bei «An:» einfach einsetzen (das Teilen-Menü erlaubt kein automatisches Ausfüllen des Empfängers).</div>
   </div>
   <div class="card">
     <h3 style="margin-top:0">Status &amp; Übergabe</h3>
@@ -1044,12 +1044,42 @@ function renderExport() {
     }));
   }));
 
-  $('#btnMailKunde').addEventListener('click', () => {
+  $('#btnMailKunde').addEventListener('click', async () => {
+    const btn = $('#btnMailKunde');
     const ku = k.kunde;
+    const uvIds = $$('.rptuvsel:checked').map(c => c.value);
+    const ohneBox = $('#rptohne');
+    const includeOhne = ohneBox ? ohneBox.checked : true;
+    const inspKuerzel = $$('.rptinspsel:checked').map(c => c.value);
     const anlage = [ku.strasse, [ku.plz, ku.ort].filter(Boolean).join(' ')].filter(Boolean).join(', ');
-    const subject = `Kontrollbericht ${anlage}`;
-    const body = `Guten Tag\n\nIm Anhang erhalten Sie den Kontrollbericht zur elektrischen Anlage ${anlage}.\n\nFreundliche Grüsse\n${SETTINGS.inspName || ''}\n${SETTINGS.firmaName || ''}`;
-    location.href = `mailto:${encodeURIComponent(ku.eigMail || '')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    btn.disabled = true;
+    const oldLabel = btn.textContent;
+    btn.textContent = '⏳ PDF wird erstellt …';
+    try {
+      const { blob, fname } = await buildReportPdf({ uvIds, includeOhne, inspKuerzel });
+      const file = new File([blob], fname + '.pdf', { type: 'application/pdf' });
+      // Kundenadresse in die Zwischenablage (Teilen-Menü kann keinen Empfänger vorausfüllen)
+      if (ku.eigMail && navigator.clipboard) {
+        try { await navigator.clipboard.writeText(ku.eigMail); } catch (e) { /* egal */ }
+      }
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: `Kontrollbericht ${anlage}` });
+      } else {
+        // Fallback ohne Teilen-Menü (z.B. Desktop): PDF herunterladen + Mail-Entwurf öffnen
+        download(fname + '.pdf', blob, 'application/pdf');
+        const subject = `Kontrollbericht ${anlage}`;
+        const body = `Guten Tag\n\nIm Anhang erhalten Sie den Kontrollbericht zur elektrischen Anlage ${anlage}.\n\nFreundliche Grüsse\n${SETTINGS.inspName || ''}\n${SETTINGS.firmaName || ''}`;
+        location.href = `mailto:${encodeURIComponent(ku.eigMail || '')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+        alert('Teilen wird hier nicht unterstützt – das PDF wurde heruntergeladen und ein Mail-Entwurf geöffnet. Das PDF bitte von Hand anhängen.');
+      }
+    } catch (err) {
+      if (!err || err.name !== 'AbortError') {
+        alert('Bericht-PDF konnte nicht erstellt werden: ' + (err && err.message ? err.message : err));
+      }
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldLabel;
+    }
   });
 
   $('#btnAddZeit').addEventListener('click', () => {
@@ -1251,8 +1281,10 @@ async function showReport(sel) {
     inspektoren = [{ kuerzel: '', name: SETTINGS.inspName, tel: SETTINGS.inspTel, mail: SETTINGS.inspMail }];
   }
 
+  const auftragTitel = [ku.auftragNr, ku.auftragBez].filter(Boolean).join(' ') || '–';
+
   let html = `<div class="rpthead">
-    <div class="rpttitle"><h1>Kontrollbericht</h1><div>Nummer&nbsp;&nbsp;<b>${dash(ku.auftragNr)}</b></div></div>
+    <div class="rpttitle"><h1>Kontrollbericht</h1><div>Auftrag:&nbsp;&nbsp;<b>${esc(auftragTitel)}</b></div></div>
     <table class="rpt">
       <tr>
         <td class="lbl">Auftraggeber<br>(Eigentümer)</td>
@@ -1372,6 +1404,228 @@ async function showReport(sel) {
 
   $('#printarea').innerHTML = html;
   setTimeout(() => window.print(), 150);
+}
+
+/* ---- Kontrollbericht als PDF-Datei (jsPDF) – für den Mail-Anhang via Teilen-Menü.
+   Achtung: Auswahl-Logik und Aufbau entsprechen showReport() – Änderungen dort
+   müssen hier nachgezogen werden! ---- */
+
+async function buildReportPdf(sel) {
+  if (!window.jspdf || !window.jspdf.jsPDF) throw new Error('PDF-Bibliothek (jspdf.min.js) nicht geladen');
+  const { jsPDF } = window.jspdf;
+  const k = S.kontrolle;
+  const ku = k.kunde;
+  const heute = new Date().toLocaleDateString('de-CH');
+
+  const uvIds = sel && sel.uvIds ? sel.uvIds : k.uvs.map(u => u.id);
+  const inclOhne = sel ? !!sel.includeOhne : true;
+  const inclUvs = k.uvs.filter(u => uvIds.includes(u.id));
+  const istOhneUv = m => !k.uvs.some(u => u.id === m.uvId);
+  const inBericht = m => uvIds.includes(m.uvId) || (inclOhne && istOhneUv(m));
+  const mangelItems = k.maengel.filter(m => !istInfo(m) && inBericht(m));
+  const infoItems = k.maengel.filter(m => istInfo(m) && inBericht(m));
+  const selKz = sel && sel.inspKuerzel ? sel.inspKuerzel : [];
+  let inspektoren = (SETTINGS.inspektoren || []).filter(i => selKz.includes(i.kuerzel));
+  if (!inspektoren.length && SETTINGS.inspName) {
+    inspektoren = [{ kuerzel: '', name: SETTINGS.inspName, tel: SETTINGS.inspTel, mail: SETTINGS.inspMail }];
+  }
+  const uvNamen = inclUvs.map(u => (u.name || 'Anlage ohne Name') + (u.ort ? ' (Zähler ' + u.ort + ')' : ''))
+    .concat(inclOhne && k.maengel.some(istOhneUv) ? ['Allgemein'] : []);
+
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const W = 210, M = 15, CW = W - 2 * M, BOTTOM = 282;
+  let y = M;
+  const ensure = h => { if (y + h > BOTTOM) { doc.addPage(); y = M; } };
+  const wrap = (t, w) => doc.splitTextToSize(String(t || '–'), w);
+  const imgFormat = d => d.includes('image/png') ? 'PNG' : 'JPEG';
+
+  // ---- Kopf ----
+  const headTop = y;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15);
+  doc.text('Kontrollbericht', M + 3, y + 8);
+  const auftragTitel = 'Auftrag: ' + ([ku.auftragNr, ku.auftragBez].filter(Boolean).join(' ') || '–');
+  doc.setFontSize(10);
+  if (doc.getTextWidth(auftragTitel) > 115) doc.setFontSize(8.5); // langer Auftrag: kleiner, damit er nicht in den Titel läuft
+  doc.text(auftragTitel, W - M - 3, y + 8, { align: 'right' });
+  doc.setFontSize(10);
+  y += 11;
+  doc.setLineWidth(0.3);
+  doc.line(M, y, W - M, y);
+  y += 2.5;
+
+  const L1 = M + 3, V1 = M + 38, L2 = M + 100, V2 = M + 128;
+  const V1W = L2 - V1 - 4, V2W = W - M - V2 - 3, L1W = V1 - L1 - 2;
+  const headRow = (l1, v1, l2, v2) => {
+    doc.setFontSize(9);
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(90);
+    const la = wrap(l1, L1W);
+    doc.text(la, L1, y + 3.5);
+    if (l2) doc.text(wrap(l2, V2 - L2 - 2), L2, y + 3.5);
+    doc.setTextColor(0); doc.setFont('helvetica', 'bold');
+    const a = wrap(v1, V1W), b = l2 ? wrap(v2, V2W) : [];
+    doc.text(a, V1, y + 3.5);
+    if (l2) doc.text(b, V2, y + 3.5);
+    doc.setFont('helvetica', 'normal');
+    y += Math.max(a.length, b.length, la.length) * 4 + 2.5;
+  };
+  headRow('Auftraggeber (Eigentümer)',
+    [ku.eigName, ku.eigStrasse, [ku.eigPlz, ku.eigOrt].filter(Boolean).join(' ')].filter(Boolean).join('\n') || '–',
+    'Auftragnehmer',
+    [SETTINGS.firmaName, SETTINGS.firmaStrasse, SETTINGS.firmaPlzOrt].filter(Boolean).join('\n') || '–');
+  headRow('Ort der Installation',
+    [ku.strasse, [ku.plz, ku.ort].filter(Boolean).join(' ')].filter(Boolean).join(', ') || '–',
+    'Gebäudeart', ku.gebaeudeart || '–');
+  headRow('Auftragsbezeichnung', ku.auftragBez || '–', 'VNB', ku.zaehler || '–');
+  headRow('Kontrollumfang', ku.kontrollumfang || '–', 'Anlage(n)', uvNamen.join(', ') || '–');
+  headRow('Kontrolle am / durch',
+    heute + (inspektoren.length ? '\n' + inspektoren.map(i => i.name || i.kuerzel).join('\n') : ''),
+    'Tel. / E-Mail',
+    inspektoren.length ? inspektoren.map(i => [i.tel, i.mail].filter(Boolean).join(' · ') || '–').join('\n') : '–');
+  headRow('Mängel',
+    mangelItems.length ? `[X] Ja (${mangelItems.length})      [  ] Nein` : '[  ] Ja      [X] Nein', '', '');
+  doc.rect(M, headTop, CW, y - headTop);
+  y += 8;
+
+  const drawFotos = async fotos => {
+    for (const pid of fotos) {
+      const rec = await dbGet('photos', pid);
+      if (!rec) continue;
+      const d = await blobToDataURL(rec.blob);
+      let p;
+      try { p = doc.getImageProperties(d); } catch (e) { continue; }
+      let w = 75, h = w * p.height / p.width;
+      if (h > 75) { h = 75; w = h * p.width / p.height; }
+      ensure(h + 4);
+      doc.addImage(d, imgFormat(d), M + 5, y, w, h);
+      y += h + 4;
+    }
+  };
+
+  // ---- Mängelliste ----
+  ensure(12);
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(13);
+  doc.text('Mängelliste', M, y + 5); y += 9;
+
+  if (!mangelItems.length) {
+    doc.setFontSize(10.5);
+    ensure(8); doc.text('Keine Mängel festgestellt.', M, y + 4); y += 8;
+    doc.setFont('helvetica', 'normal');
+  } else {
+    const gruppen = [];
+    for (const uv of inclUvs) {
+      const ms = mangelItems.filter(m => m.uvId === uv.id);
+      if (ms.length) gruppen.push({ titel: (uv.name || 'Anlage ohne Name') + (uv.ort ? ' – Zähler ' + uv.ort : ''), ms });
+    }
+    const ohne = mangelItems.filter(istOhneUv);
+    if (ohne.length) gruppen.push({ titel: 'Allgemein / ohne Anlage', ms: ohne });
+    let nr = 0;
+    for (const grp of gruppen) {
+      ensure(14);
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
+      doc.text(grp.titel, M, y + 4);
+      doc.setLineWidth(0.2); doc.line(M, y + 5.5, W - M, y + 5.5);
+      y += 9;
+      for (const m of grp.ms) {
+        nr++;
+        const zeilen = wrap(m.text || '–', CW - 10);
+        ensure(6 + Math.min(zeilen.length, 5) * 4.3);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5);
+        doc.text(nr + '.  ' + (m.ort || '–'), M, y + 4); y += 6.5;
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+        for (const z of zeilen) { ensure(5); doc.text(z, M + 5, y + 3.2); y += 4.3; }
+        y += 2;
+        await drawFotos(m.fotos);
+        y += 2;
+      }
+    }
+  }
+
+  // ---- Information ----
+  if (infoItems.length) {
+    ensure(14);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(13);
+    doc.text('Information', M, y + 5); y += 9;
+    const uvNameById = id => { const u = k.uvs.find(x => x.id === id); return u ? (u.name || 'Anlage ohne Name') : ''; };
+    for (const m of infoItems) {
+      const kopf = [uvNameById(m.uvId), m.ort].filter(Boolean).join(' – ');
+      const zeilen = wrap(m.text || '–', CW - 10);
+      ensure((kopf ? 6.5 : 0) + Math.min(zeilen.length, 5) * 4.3);
+      if (kopf) {
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5);
+        doc.text(kopf, M, y + 4); y += 6.5;
+      }
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+      for (const z of zeilen) { ensure(5); doc.text(z, M + 5, y + 3.2); y += 4.3; }
+      y += 2;
+      await drawFotos(m.fotos);
+      y += 2;
+    }
+  }
+
+  // ---- Datum / Unterschrift ----
+  let sigDataUrl = null;
+  try {
+    const sb = await dbGet('kv', 'signatur');
+    if (sb) sigDataUrl = await blobToDataURL(sb);
+  } catch (e) { /* ohne Unterschrift weiterfahren */ }
+  ensure(sigDataUrl ? 28 : 20);
+  y += 5;
+  doc.setFontSize(10); doc.setFont('helvetica', 'normal');
+  doc.text('Datum', M + 2, y + 5);
+  doc.setFont('helvetica', 'bold');
+  doc.text(heute, M + 18, y + 5);
+  doc.setFont('helvetica', 'normal');
+  doc.text('Unterschrift', M + 78, y + 5);
+  doc.setFont('helvetica', 'bold');
+  doc.text(inspektoren.length ? inspektoren.map(i => i.name || i.kuerzel).join(' / ') : '–', M + 101, y + 5);
+  doc.setFont('helvetica', 'normal');
+  if (sigDataUrl) {
+    try {
+      const p = doc.getImageProperties(sigDataUrl);
+      const h = 14, w = Math.min(h * p.width / p.height, 60);
+      doc.addImage(sigDataUrl, imgFormat(sigDataUrl), M + 101, y + 7, w, h);
+    } catch (e) { /* Bild nicht lesbar – nur Name */ }
+    y += 26;
+  } else {
+    doc.setLineWidth(0.3); doc.line(M + 101, y + 13, M + 168, y + 13);
+    y += 18;
+  }
+
+  // ---- Erledigungstext + Bestätigungsblock (nur wenn Mängel) ----
+  if (mangelItems.length) {
+    doc.setFontSize(9.5);
+    const erl = wrap(SETTINGS.erledigungsText || '', CW - 8);
+    const kopfTxt = wrap('Die Unterzeichnenden bestätigen, dass die Mängel gemäss Kontrollbericht nach NIV Art. 3 + 4 behoben wurden.', CW - 6);
+    const kh = kopfTxt.length * 4.2 + 4;
+    ensure(erl.length * 4.2 + 8 + kh + 26 + 8);
+    y += 3;
+    doc.setLineWidth(0.25);
+    doc.rect(M, y, CW, erl.length * 4.2 + 5);
+    doc.text(erl, M + 4, y + 4.5);
+    y += erl.length * 4.2 + 9;
+    doc.setFillColor(235, 235, 235);
+    doc.rect(M, y, CW, kh, 'FD');
+    doc.setFont('helvetica', 'bold');
+    doc.text(kopfTxt, M + 3, y + 4.5);
+    y += kh;
+    const cw3 = CW / 3, ch = 26;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(60);
+    for (let i = 0; i < 3; i++) doc.rect(M + i * cw3, y, cw3, ch);
+    doc.text('Datum der Mängelbehebung', M + 2, y + 4);
+    doc.text('Firmenstempel', M + cw3 + 2, y + 4);
+    doc.text(wrap('Unterschrift fachkundige Person oder Elektro-Kontrolleur gemäss NIV Art. 27', cw3 - 4), M + 2 * cw3 + 2, y + 4);
+    doc.setTextColor(0);
+    y += ch;
+  }
+
+  // Dateiname wie beim Druck-Bericht
+  let uvPart;
+  if (!k.uvs.length) uvPart = 'Kontrolle';
+  else if (inclUvs.length === k.uvs.length) uvPart = k.uvs.length > 1 ? 'alle Anlagen' : (inclUvs[0].name || 'Anlage');
+  else uvPart = inclUvs.map(u => u.name || 'Anlage').join('+') || 'Allgemein';
+  const fname = ['Kontrollbericht', fnSan(uvPart), fnSan(ku.strasse), fnSan(ku.ort)].filter(Boolean).join('_');
+
+  return { blob: doc.output('blob'), fname };
 }
 
 function blobToDataURL(blob) {
@@ -1495,7 +1749,7 @@ function renderSettings() {
     </div>
   </div>
   <div class="card">
-    <div class="hint">App-Version: <span id="appver">1.8</span> · Daten werden lokal auf diesem Gerät gespeichert (IndexedDB). Regelmässig unter <b>📤 Export</b> ein Backup sichern!</div>
+    <div class="hint">App-Version: <span id="appver">2.0</span> · Daten werden lokal auf diesem Gerät gespeichert (IndexedDB). Regelmässig unter <b>📤 Export</b> ein Backup sichern!</div>
   </div>`;
 
   const paintSig = async () => {

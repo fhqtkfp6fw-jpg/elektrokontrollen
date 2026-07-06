@@ -1,7 +1,7 @@
 'use strict';
 
-const CACHE = 'nivapp-v15';
-const ASSETS = ['./', './index.html', './app.css', './app.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
+const CACHE = 'nivapp-v17';
+const ASSETS = ['./', './index.html', './app.css', './app.js', './jspdf.min.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
   // cache:'reload' umgeht den HTTP-Cache, damit Updates wirklich frische Dateien holen
